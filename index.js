@@ -86,7 +86,7 @@ const formatter = {
 // API utility
 const api = {
   baseURL: 'https://api.gradient.network/api',
-  timeout: 30000,
+  timeout: process.env.API_TIMEOUT || 15000,
 
   getHeaders() {
     const token = process.env.GRADIENT_TOKEN;
@@ -119,6 +119,14 @@ const api = {
     } catch (error) {
       if (error.response?.status === 401) {
         throw new Error('Token tidak valid atau sudah expired');
+      } else if (error.response?.status === 403) {
+        throw new Error('Akses ditolak - periksa token atau permissions');
+      } else if (error.response?.status === 429) {
+        throw new Error('Rate limit exceeded - tunggu beberapa saat');
+      } else if (error.response?.status >= 500) {
+        throw new Error('Server error - coba lagi nanti');
+      } else if (error.code === 'ECONNABORTED') {
+        throw new Error('Request timeout - koneksi lambat');
       }
       throw error;
     }
@@ -131,6 +139,10 @@ const api = {
   async getSentryNodes(nodeId = null) {
     const endpoint = nodeId ? `/sentrynode?nodeId=${nodeId}` : '/sentrynode';
     return this.makeRequest(endpoint);
+  },
+
+  async getNodeDetail(nodeId) {
+    return this.makeRequest(`/sentrynode/get/${nodeId}`);
   },
 
   async getLatencyData(nodeId) {
@@ -204,15 +216,11 @@ const autoPingService = {
     if (!this.isRunning) return;
 
     try {
-      const pingPromises = [
-        api.getStatus(),
-        this.userNodeId ? api.getSentryNodes(this.userNodeId) : api.getSentryNodes()
-      ];
-
+      // Hanya ping status endpoint untuk mengurangi beban
       await Promise.race([
-        Promise.all(pingPromises),
+        api.getStatus(),
         new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Ping timeout')), 15000)
+          setTimeout(() => reject(new Error('Ping timeout')), 10000)
         )
       ]);
 
@@ -233,14 +241,23 @@ const autoPingService = {
       this.errorCount++;
       process.stdout.write(chalk.red('×'));
 
+      // Log error details untuk debugging
+      if (process.env.DEBUG === 'true') {
+        console.log(chalk.gray(`\nDebug - Error: ${error.message}`));
+      }
+
       if (this.errorCount >= this.maxErrors) {
         console.log(chalk.red(`\n❌ Terlalu banyak error (${this.errorCount}/${this.maxErrors})`));
         console.log(chalk.red('🛑 Menghentikan auto-ping untuk mencegah spam'));
+        console.log(chalk.yellow('💡 Kemungkinan penyebab:'));
+        console.log(chalk.gray('   • Token expired - perlu token baru'));
+        console.log(chalk.gray('   • Koneksi internet bermasalah'));
+        console.log(chalk.gray('   • Server Gradient sedang maintenance'));
         this.stop();
         return;
       }
 
-      if (this.pingCount % 10 === 0) {
+      if (this.errorCount % 2 === 0) {
         console.log(chalk.yellow(`\n⚠️  Error count: ${this.errorCount}/${this.maxErrors}`));
       }
     }
@@ -480,6 +497,141 @@ async function nodeCommand() {
   } catch (error) {
     formatter.showError('Gagal mengambil data node', error);
     logger.logError('node', error);
+  }
+}
+
+async function nodeDetailCommand(nodeId) {
+  try {
+    console.log(chalk.blue(`🔍 Mengambil detail node: ${nodeId}...\n`));
+    
+    const nodeDetail = await api.getNodeDetail(nodeId);
+    
+    if (nodeDetail.code !== 200) {
+      throw new Error('Gagal mengambil detail node');
+    }
+    
+    const data = nodeDetail.data;
+    
+    console.log(chalk.cyan.bold('='.repeat(70)));
+    console.log(chalk.cyan.bold(`🖥️  DETAIL NODE - ${data.id}`));
+    console.log(chalk.cyan.bold('='.repeat(70)));
+    
+    // Basic Info Table
+    const basicTable = new Table({
+      head: [chalk.cyan('Informasi'), chalk.cyan('Value')],
+      colWidths: [25, 45]
+    });
+    
+    const status = data.active ? 
+      (data.connect ? chalk.green('🟢 Online & Connected') : chalk.yellow('🟡 Active but Disconnected')) :
+      chalk.red('🔴 Inactive');
+    
+    basicTable.push(
+      ['🆔 Node ID', chalk.white(data.id)],
+      ['👤 Account ID', chalk.gray(data.account)],
+      ['🏷️  Nama Node', chalk.white(data.name)],
+      ['⚡ Status', status],
+      ['🚫 Banned', data.banned ? chalk.red('Ya') : chalk.green('Tidak')],
+      ['📅 Dibuat', new Date(data.createAt).toLocaleString('id-ID')]
+    );
+    
+    console.log(basicTable.toString());
+    console.log();
+    
+    // Performance Stats
+    const performanceTable = new Table({
+      head: [chalk.yellow('📊 PERFORMA'), chalk.yellow('Value')],
+      colWidths: [25, 45]
+    });
+    
+    performanceTable.push(
+      ['⏱️  Total Duration', formatter.formatDuration(Math.floor(data.duration / 1000))],
+      ['📡 Latency', `${data.latency}ms`],
+      ['💎 Total Points', chalk.green(formatter.formatNumber(data.point))],
+      ['🏆 Season 1 Points', chalk.blue(formatter.formatNumber(data.season['1'] || 0))],
+      ['📈 Score', data.score.toString()]
+    );
+    
+    console.log(performanceTable.toString());
+    console.log();
+    
+    // Today's Stats
+    const todayTable = new Table({
+      head: [chalk.green('📅 HARI INI'), chalk.green('Value')],
+      colWidths: [25, 45]
+    });
+    
+    todayTable.push(
+      ['💰 Points Hari Ini', chalk.green(formatter.formatNumber(data.today))],
+      ['⏱️  Duration Hari Ini', formatter.formatDuration(Math.floor(data.todayDuration / 1000))],
+      ['📡 Latency Hari Ini', `${data.todayLatency}ms`],
+      ['🔄 Last Active', data.lastActive === 0 ? chalk.green('Aktif sekarang') : new Date(data.lastActive).toLocaleString('id-ID')]
+    );
+    
+    console.log(todayTable.toString());
+    console.log();
+    
+    // Location Info
+    if (data.location) {
+      const locationTable = new Table({
+        head: [chalk.blue('🌍 LOKASI'), chalk.blue('Value')],
+        colWidths: [25, 45]
+      });
+      
+      locationTable.push(
+        ['🌐 IP Address', chalk.white(data.ip)],
+        ['🏳️  Negara', chalk.white(data.location.country)],
+        ['📍 Region', chalk.white(data.location.region)],
+        ['🏙️  Kota', chalk.white(data.location.place)],
+        ['📮 Kode Pos', data.location.postcode === 'N/A' ? chalk.gray('Tidak tersedia') : chalk.white(data.location.postcode)],
+        ['🗺️  Koordinat', `${data.location.lat}, ${data.location.lng}`]
+      );
+      
+      console.log(locationTable.toString());
+      console.log();
+    }
+    
+    // Performance Analysis
+    console.log(chalk.cyan('🔍 ANALISIS PERFORMA'));
+    console.log(chalk.cyan('='.repeat(40)));
+    
+    const dailyEfficiency = data.todayDuration > 0 ? (data.today / (data.todayDuration / 1000)) : 0;
+    const totalEfficiency = data.duration > 0 ? (data.point / (data.duration / 1000)) : 0;
+    
+    console.log(chalk.white('📈 Efisiensi Points:'));
+    console.log(chalk.gray(`   • Hari ini: ${dailyEfficiency.toFixed(2)} points/detik`));
+    console.log(chalk.gray(`   • Total: ${totalEfficiency.toFixed(2)} points/detik`));
+    
+    console.log(chalk.white('\n📡 Performa Latency:'));
+    if (data.latency < 100) {
+      console.log(chalk.green('   • Excellent - Latency sangat baik (<100ms)'));
+    } else if (data.latency < 300) {
+      console.log(chalk.yellow('   • Good - Latency cukup baik (100-300ms)'));
+    } else {
+      console.log(chalk.red('   • Poor - Latency perlu diperbaiki (>300ms)'));
+    }
+    
+    const uptimePercentage = data.duration > 0 ? ((data.duration / (Date.now() - data.createAt)) * 100) : 0;
+    console.log(chalk.white('\n⏱️  Statistik Uptime:'));
+    console.log(chalk.gray(`   • Estimasi uptime: ${uptimePercentage.toFixed(1)}%`));
+    console.log(chalk.gray(`   • Durasi aktif: ${formatter.formatDuration(Math.floor(data.duration / 1000))}`));
+    console.log(chalk.gray(`   • Umur node: ${formatter.formatDuration(Math.floor((Date.now() - data.createAt) / 1000))}`));
+    
+    // Status Indicators
+    console.log(chalk.cyan('\n🚨 STATUS CHECKS'));
+    console.log(chalk.cyan('='.repeat(30)));
+    console.log(data.active ? chalk.green('✅ Node aktif') : chalk.red('❌ Node tidak aktif'));
+    console.log(data.connect ? chalk.green('✅ Terkoneksi') : chalk.red('❌ Tidak terkoneksi'));
+    console.log(data.banned ? chalk.red('⚠️  Node di-banned') : chalk.green('✅ Node dalam kondisi baik'));
+    console.log(data.hide === 0 ? chalk.green('✅ Node visible') : chalk.yellow('⚠️  Node hidden'));
+    
+    console.log(chalk.green('\n✨ Detail node berhasil ditampilkan!'));
+    
+    logger.logActivity(`Detail node ${nodeId} dilihat`);
+    
+  } catch (error) {
+    formatter.showError('Gagal mengambil detail node', error);
+    logger.logError('nodeDetail', error);
   }
 }
 
@@ -749,6 +901,45 @@ async function statusCommand() {
   }
 }
 
+// Token validation function
+async function validateTokenCommand() {
+  try {
+    console.log(chalk.blue('🔑 Validasi token...\n'));
+    
+    const token = process.env.GRADIENT_TOKEN;
+    if (!token) {
+      console.log(chalk.red('❌ Token tidak ditemukan di .env'));
+      return;
+    }
+    
+    console.log(chalk.gray(`🔍 Token (10 karakter pertama): ${token.substring(0, 10)}...`));
+    
+    // Test dengan endpoint profil
+    const profile = await api.getUserProfile();
+    
+    if (profile.code === 200) {
+      console.log(chalk.green('✅ Token valid dan aktif'));
+      console.log(chalk.gray(`👤 User: ${profile.data.name}`));
+      console.log(chalk.gray(`📧 Email: ${profile.data.email}`));
+    } else {
+      console.log(chalk.red('❌ Token tidak valid'));
+    }
+    
+  } catch (error) {
+    if (error.message.includes('expired')) {
+      console.log(chalk.red('❌ Token sudah expired'));
+      console.log(chalk.yellow('💡 Cara mendapatkan token baru:'));
+      console.log(chalk.gray('   1. Buka browser dengan extension Gradient'));
+      console.log(chalk.gray('   2. Buka DevTools (F12) > Network tab'));
+      console.log(chalk.gray('   3. Refresh extension, cari request ke api.gradient.network'));
+      console.log(chalk.gray('   4. Copy Authorization header (setelah "Bearer ")'));
+      console.log(chalk.gray('   5. Update GRADIENT_TOKEN di file .env'));
+    } else {
+      formatter.showError('Gagal validasi token', error);
+    }
+  }
+}
+
 // Main menu function
 async function showMainMenu() {
   const autoPingStatus = autoPingService.getStatus();
@@ -766,6 +957,10 @@ async function showMainMenu() {
       value: 'node'
     },
     {
+      name: '🔍 Detail Node Spesifik',
+      value: 'nodedetail'
+    },
+    {
       name: '📡 Analisis Latency Node',
       value: 'latency'
     },
@@ -776,6 +971,10 @@ async function showMainMenu() {
     {
       name: '📊 Status Sistem Gradient Network',
       value: 'status'
+    },
+    {
+      name: '🔑 Validasi Token',
+      value: 'token'
     },
     {
       name: autoPingText,
@@ -955,6 +1154,28 @@ async function executeCommand(command) {
       await nodeCommand();
       break;
       
+    case 'nodedetail':
+      // Minta input nodeId untuk detail
+      const { detailNodeId } = await inquirer.prompt([
+        {
+          type: 'input',
+          name: 'detailNodeId',
+          message: 'Masukkan Node ID untuk melihat detail:',
+          default: 'W2F5PWFHP7YUYY7V',
+          validate: (input) => {
+            if (!input.trim()) {
+              return 'Node ID tidak boleh kosong!';
+            }
+            if (input.length < 10) {
+              return 'Node ID terlalu pendek!';
+            }
+            return true;
+          }
+        }
+      ]);
+      await nodeDetailCommand(detailNodeId);
+      break;
+      
     case 'latency':
       // Minta input nodeId untuk latency
       const { nodeId } = await inquirer.prompt([
@@ -979,6 +1200,10 @@ async function executeCommand(command) {
       
     case 'status':
       await statusCommand();
+      break;
+      
+    case 'token':
+      await validateTokenCommand();
       break;
       
     case 'autoping':
